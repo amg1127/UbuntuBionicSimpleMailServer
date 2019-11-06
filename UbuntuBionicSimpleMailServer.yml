@@ -1,0 +1,144 @@
+---
+- hosts: mailserver
+  vars:
+    mail_domain_name: "dedicatedhost.co.nz"
+  tasks:
+    - name: Create a local user for testing (sitehost / 5iteHost)
+      user:
+        name: sitehost
+        group: users
+        password: '$5$mysecretsalt$OtBk5JKoNbip441R5V6foTgnb2ygJ1wA0tHoqZtVGa.'
+        create_home: yes
+    - name: Install MTA, MUA and webmail packages
+      apt:
+        name:
+          - postfix
+          - dovecot-core
+          - dovecot-imapd
+          - dovecot-pop3d
+          - dovecot-lmtpd
+          - apache2
+          - libapache2-mod-uwsgi
+          - uwsgi
+          - uwsgi-plugin-psgi
+          - ciderwebmail
+          - mailutils
+        state: present
+        update_cache: yes
+    - name: Enable Apache, Dovecot and Postfix services
+      service:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      with_items:
+        - apache2
+        - uwsgi
+        - postfix
+        - dovecot
+########## Postfix block ##########
+    - name: Write /etc/mailname
+      copy:
+        content: "{{ mail_domain_name }}"
+        dest: /etc/mailname
+    - name: Set Postfix's LMTP service not to run chrooted, so it can connect Dovecot's LMTP socket
+      lineinfile:
+        path: /etc/postfix/master.cf
+        regexp: '^(lmtp\s+\S+\s+\S+\s+\S+\s+)[ynYN](\s+.*)$'
+        line: '\1n\2'
+        backrefs: yes
+      notify: Restart Postfix service
+    - name: Adjust several Postfix settings
+      ini_file:
+        path: /etc/postfix/main.cf
+        section: null
+        option: "{{ item.name }}"
+        value: "{{ item.value }}"
+      with_items:
+        - { name: "local_transport", value: "lmtp:unix:/run/dovecot/lmtp" }
+        - { name: "mydestination", value: "$myhostname, localhost, {{ mail_domain_name }}" }
+        - { name: "smtpd_sasl_auth_enable", value: "yes" }
+        - { name: "smtpd_sasl_type", value: "dovecot" }
+        - { name: "smtpd_sasl_path", value: "private/auth" }
+      notify: Restart Postfix service
+########## Dovecot block ##########
+    - name: Configure Dovecot to ignore the domain part at all, so it receives e-mail from Postfix correctly
+      # This is the configuration setting that I struggled to find during the test...
+      ini_file:
+        path: /etc/dovecot/conf.d/10-auth.conf
+        section: null
+        option: auth_username_format
+        value: "%Ln"
+      notify: Restart Dovecot service
+    - name: Enable PLAIN and LOGIN auth mechs
+      ini_file:
+        path: /etc/dovecot/conf.d/10-auth.conf
+        section: null
+        option: auth_mechanisms
+        value: "plain login"
+      notify: Restart Dovecot service
+    - name: Add an authentication listener inside Postfix's chroot directory
+      blockinfile:
+        path: /etc/dovecot/conf.d/10-master.conf
+        block: |
+            unix_listener /var/spool/postfix/private/auth {
+              mode = 0666
+            }
+        insertafter: "^service\\s+auth\\s*\\{\\s*$"
+      notify: Restart Dovecot service        
+########## Ciderwebmail block ##########
+    - name: Enable Apache HTTPD configuration snippets
+      file:
+        path: "/etc/apache2/{{ item.dir }}-enabled/{{ item.name }}"
+        state: link
+        src: "../{{ item.dir }}-available/{{ item.name }}"
+        force: yes
+      with_items:
+        - { dir: "sites", name: "default-ssl.conf" }
+        - { dir: "conf", name: "ciderwebmail.conf" }
+        - { dir: "mods", name: "uwsgi.load" }
+        - { dir: "mods", name: "ssl.conf" }
+        - { dir: "mods", name: "ssl.load" }
+        - { dir: "mods", name: "socache_shmcb.load" }
+      notify: Restart Apache HTTPd service
+    - name: Fix Ciderwebmail broken link
+      file:
+        path: /etc/ciderwebmail/apache-uwsgi.conf
+        state: link
+        src: ./apache2-uwsgi.conf
+        force: yes
+      notify: Restart Apache HTTPd service
+    - name: Deploy an index.html file that redirects requests from root to Cinderwebmail
+      copy:
+        content: |
+          <html>
+          <head>
+          <meta http-equiv='Refresh' content='0; url=/cider' />
+          </head>
+          <body />
+          </html>
+        dest: /var/www/html/index.html
+    - name: Enable UWSGI configuration snippet for Ciderwebmail
+      file:
+        path: "/etc/uwsgi/apps-enabled/ciderwebmail.ini"
+        state: link
+        src: "../apps-available/ciderwebmail.ini"
+        force: yes
+      notify: Restart UWSGI service
+  handlers:
+    - name: Restart Apache HTTPd service
+      service:
+        name: apache2
+        state: restarted
+    - name: Restart UWSGI service
+      service:
+        name: uwsgi
+        state: restarted
+    - name: Restart Postfix service
+      service:
+        name: postfix
+        state: restarted
+    - name: Restart Dovecot service
+      service:
+        name: dovecot
+        state: restarted
+
